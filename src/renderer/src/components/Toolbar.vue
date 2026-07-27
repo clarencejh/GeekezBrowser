@@ -1,6 +1,6 @@
 <template>
     <div>
-    <div class="toolbar">
+    <div class="toolbar" :class="{ 'import-menu-open': importMenuVisible }">
         <div style="display:flex; gap:15px; align-items:center;">
             <label style="font-size:13px; cursor:pointer; display:flex; align-items:center; gap:8px;">
                 <input type="checkbox" v-model="proxyStore.settings.enablePreProxy" @change="handlePreProxyToggle" style="width:auto; margin:0;"> 

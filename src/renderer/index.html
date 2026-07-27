@@ -207,6 +207,8 @@
         .profile-item,
         .modal-content,
         .lang-btn,
+        .import-menu-dropdown,
+        .menu-item,
         .logo {
             -webkit-app-region: no-drag;
         }
@@ -554,6 +556,12 @@
             justify-content: space-between;
             margin-bottom: 10px;
             border-left: 4px solid var(--accent);
+            position: relative;
+            overflow: visible;
+        }
+
+        .toolbar.import-menu-open {
+            z-index: 900;
         }
 
         /* Shared glass layer for every color theme. */
