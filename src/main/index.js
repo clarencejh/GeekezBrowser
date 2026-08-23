@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, screen, shell, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, shell, Tray, Menu, nativeImage, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs-extra');
 const { spawn, exec, execSync } = require('child_process');
@@ -17,6 +17,7 @@ const { CLOSE_BEHAVIOR, decideCloseAction, normalizeCloseBehavior } = require('.
 const { fetchLatestGitHubReleaseInfo } = require('./release-check');
 const xrayRelease = require('./xray-assets');
 const { supportsNativeGlass, getMainWindowMaterialOptions } = require('./native-glass');
+const { allocateLocalProxyPort, isXrayLocalBindFailure } = require('./local-proxy-port');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 const initSqlJs = require('sql.js');
@@ -74,7 +75,7 @@ async function createSocksProxyAgent(proxyUrl) {
 // Only disable if GPU compatibility issues occur
 
 import { generateXrayConfig, parseProxyLink, getProxyRemark } from './utils';
-import { generateFingerprint, getInjectScript, getWatermarkScript } from './fingerprint';
+import { generateFingerprint, getInjectScript } from './fingerprint';
 
 const isDev = !app.isPackaged;
 const RESOURCES_BIN = isDev ? path.join(app.getAppPath(), 'resources', 'bin') : path.join(process.resourcesPath, 'bin');
@@ -2489,6 +2490,7 @@ async function stopRunningProfile(profileId, options = {}) {
     const proc = activeProcesses[profileId];
     if (!proc) return false;
 
+    proc.stopping = true;
     clearProfileRuntimeLanguageState(profileId);
     await forceKill(proc.xrayPid);
     try { await proc.browser.close(); } catch (e) { }
@@ -3296,6 +3298,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 app.whenReady().then(async () => {
     cachedCloseBehavior = normalizeCloseBehavior(readSettingsSync().closeBehavior);
+    initializeProxyRecoveryMonitor();
     createWindow();
     await createTray().catch((err) => {
         console.error('Failed to initialize tray:', err);
@@ -3407,6 +3410,19 @@ async function waitForLocalPortReady(port, timeoutMs = 1500) {
     return false;
 }
 
+function spawnXrayProcess(configPath, logFd) {
+    const child = spawn(BIN_PATH, ['-c', configPath], {
+        cwd: BIN_DIR,
+        env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN },
+        stdio: ['ignore', logFd, logFd],
+        windowsHide: true
+    });
+    child.once('error', (error) => {
+        console.error(`[Xray Process Error] ${error?.message || error}`);
+    });
+    return child;
+}
+
 function readFileTailSafe(filePath, maxLength = 500) {
     try {
         if (!filePath || !fs.existsSync(filePath)) return '';
@@ -3418,8 +3434,125 @@ function readFileTailSafe(filePath, maxLength = 500) {
     }
 }
 
+function readFileSinceSafe(filePath, startOffset = 0, maxLength = 4000) {
+    let fd;
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return '';
+        fd = fs.openSync(filePath, 'r');
+        const size = fs.fstatSync(fd).size;
+        if (size <= startOffset) return '';
+        const position = Math.max(startOffset, size - maxLength);
+        const length = size - position;
+        const buffer = Buffer.alloc(length);
+        fs.readSync(fd, buffer, 0, length, position);
+        return buffer.toString('utf8');
+    } catch (e) {
+        return '';
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch (e) { }
+        }
+    }
+}
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function attachXrayExitRecovery(profileId, child) {
+    if (!child) return;
+    const scheduleRecovery = (code, signal) => {
+        const proc = activeProcesses[profileId];
+        if (!proc || proc.stopping || proc.xrayProcess !== child) return;
+        proc.xrayPid = null;
+        console.warn(`[Xray Recovery] ${profileId}: process exited (code=${code}, signal=${signal || 'none'})`);
+        setTimeout(() => {
+            recoverProfileProxy(profileId, 'unexpected-xray-exit').catch((error) => {
+                console.error(`[Xray Recovery] ${profileId}: ${error?.message || error}`);
+            });
+        }, 500);
+    };
+
+    if (child.exitCode !== null) {
+        scheduleRecovery(child.exitCode, child.signalCode);
+        return;
+    }
+    child.once('exit', scheduleRecovery);
+}
+
+async function restartProfileXray(profileId, proc, reason) {
+    const previousPid = proc.xrayPid;
+    proc.xrayPid = null;
+    proc.xrayProcess = null;
+    await forceKill(previousPid);
+    await sleep(150);
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        if (activeProcesses[profileId] !== proc || proc.stopping || !proc.browser?.isConnected()) {
+            return false;
+        }
+
+        const child = spawnXrayProcess(proc.xrayConfigPath, proc.logFd);
+        proc.xrayProcess = child;
+        proc.xrayPid = child.pid || null;
+        attachXrayExitRecovery(profileId, child);
+
+        if (await waitForLocalPortReady(proc.localPort, 2500)) {
+            await sleep(100);
+            if (child.exitCode === null) {
+                console.log(`[Xray Recovery] ${profileId}: restored on port ${proc.localPort} (${reason})`);
+                return true;
+            }
+        }
+
+        if (proc.xrayProcess === child) {
+            proc.xrayProcess = null;
+            proc.xrayPid = null;
+        }
+        await forceKill(child.pid);
+        if (attempt < 3) await sleep(250);
+    }
+
+    console.error(`[Xray Recovery] ${profileId}: failed to restore on port ${proc.localPort} (${reason})`);
+    return false;
+}
+
+async function recoverProfileProxy(profileId, reason = 'runtime-health-check') {
+    const proc = activeProcesses[profileId];
+    if (!proc || proc.stopping || proc.recoveringProxy || !proc.localPort || !proc.xrayConfigPath) {
+        return false;
+    }
+
+    proc.recoveringProxy = true;
+    try {
+        const health = await waitForSocksProxyUsable(proc.localPort, 4500, 1200, proc.xrayProcess);
+        if (health.success) return true;
+        if (activeProcesses[profileId] !== proc || proc.stopping || !proc.browser?.isConnected()) {
+            return false;
+        }
+
+        console.warn(`[Xray Recovery] ${profileId}: proxy unhealthy after ${reason}: ${health.msg || 'unknown'}`);
+        return await restartProfileXray(profileId, proc, reason);
+    } finally {
+        proc.recoveringProxy = false;
+    }
+}
+
+function initializeProxyRecoveryMonitor() {
+    let resumeTimer = null;
+    const scheduleRecovery = (reason) => {
+        if (resumeTimer) clearTimeout(resumeTimer);
+        resumeTimer = setTimeout(() => {
+            resumeTimer = null;
+            for (const profileId of Object.keys(activeProcesses)) {
+                recoverProfileProxy(profileId, reason).catch((error) => {
+                    console.error(`[Xray Recovery] ${profileId}: ${error?.message || error}`);
+                });
+            }
+        }, 2500);
+    };
+    powerMonitor.on('resume', () => scheduleRecovery('system-resume'));
+    powerMonitor.on('unlock-screen', () => scheduleRecovery('screen-unlock'));
 }
 
 function formatProbeDetail(detail = {}) {
@@ -5037,6 +5170,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         const shouldLaunchXray = (!useDirectNetwork) || !!activePreProxy;
         let xrayLogPath = null;
+        let xrayConfigPath = null;
         if (shouldLaunchXray) {
             updateLaunchProgress(
                 32,
@@ -5046,16 +5180,11 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 true,
                 { step: 4, profileName: progressProfileName }
             );
-            localPort = await getAvailablePort();
-            const xrayConfigPath = path.join(profileDir, 'config.json');
+            xrayConfigPath = path.join(profileDir, 'config.json');
             xrayLogPath = path.join(profileDir, 'xray_run.log');
             const upstreamProxy = useDirectNetwork ? activePreProxy?.url : profile.proxyStr;
             const chainedPreProxy = useDirectNetwork ? null : finalPreProxyConfig;
-            const config = generateXrayConfig(upstreamProxy, localPort, chainedPreProxy, profile.fingerprint);
-            fs.writeJsonSync(xrayConfigPath, config);
             logFd = fs.openSync(xrayLogPath, 'a');
-            const xrayLaunchStartedAt = Date.now();
-            xrayProcess = spawn(BIN_PATH, ['-c', xrayConfigPath], { cwd: BIN_DIR, env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN }, stdio: ['ignore', logFd, logFd], windowsHide: true });
             const preProxyLabel = activePreProxy?.remark || activePreProxy?.name || activePreProxy?.id || '';
             const preProxyCheckPromise = activePreProxy?.url
                 ? startPreProxyHealthCheck(activePreProxy.url)
@@ -5089,19 +5218,43 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 }
                 return first.value;
             };
-            updateLaunchProgress(
-                40,
-                preferredLang === 'en' ? 'Waiting for local proxy port...' : '正在等待本地代理端口就绪...',
-                true,
-                { step: 4, profileName: progressProfileName }
-            );
+            let xrayLaunchStartedAt = 0;
             const readyTimeoutMs = 2500;
-            const ready = await awaitWithPreProxyPriority(waitForLocalPortReady(localPort, readyTimeoutMs));
-            if (!ready) {
+            const maxBindAttempts = 3;
+            for (let attempt = 1; attempt <= maxBindAttempts; attempt++) {
+                localPort = await allocateLocalProxyPort();
+                const config = generateXrayConfig(upstreamProxy, localPort, chainedPreProxy, profile.fingerprint);
+                fs.writeJsonSync(xrayConfigPath, config);
+                const logOffset = fs.fstatSync(logFd).size;
+                xrayLaunchStartedAt = Date.now();
+                xrayProcess = spawnXrayProcess(xrayConfigPath, logFd);
+
+                updateLaunchProgress(
+                    40,
+                    attempt === 1
+                        ? (preferredLang === 'en' ? 'Waiting for local proxy port...' : '正在等待本地代理端口就绪...')
+                        : (preferredLang === 'en' ? 'Retrying local proxy port...' : '正在重新分配本地代理端口...'),
+                    true,
+                    { step: 4, profileName: progressProfileName }
+                );
+                const ready = await awaitWithPreProxyPriority(waitForLocalPortReady(localPort, readyTimeoutMs));
+                if (ready) {
+                    await sleep(100);
+                    if (xrayProcess.exitCode === null) break;
+                }
+
                 const exitCode = xrayProcess.exitCode;
                 const reason = exitCode !== null
                     ? `xray exited before ready (code: ${exitCode})`
                     : `xray socks port ${localPort} not ready within ${readyTimeoutMs}ms`;
+                const attemptLog = readFileSinceSafe(xrayLogPath, logOffset);
+                if (attempt < maxBindAttempts && isXrayLocalBindFailure(attemptLog, localPort)) {
+                    console.warn(`[Xray Launch Retry] local port ${localPort} bind failed; allocating another TCP/UDP port`);
+                    await forceKill(xrayProcess.pid);
+                    xrayProcess = null;
+                    await sleep(150);
+                    continue;
+                }
                 throw createProxyStartupError(profile.name, reason, xrayLogPath, uiLang);
             }
 
@@ -5265,9 +5418,12 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             disabledFeatures.push('StartupLaunch', 'StartupBoost');
         }
 
+        const uaSpoofEnabled = String(profile.fingerprint?.uaMode || 'none').toLowerCase() !== 'none';
+        const launchWindow = profile.fingerprint?.window || { width: 1280, height: 800 };
+
         const launchArgs = [
             `--user-data-dir=${userDataDir}`,
-            `--window-size=${profile.fingerprint?.window?.width || 1280},${profile.fingerprint?.window?.height || 800}`,
+            `--window-size=${launchWindow.width || 1280},${launchWindow.height || 800}`,
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-blink-features=AutomationControlled',
@@ -5296,7 +5452,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             launchArgs.unshift('--no-proxy-server');
         }
 
-        if (profile.fingerprint?.userAgent) {
+        if (uaSpoofEnabled && profile.fingerprint?.userAgent) {
             launchArgs.push(`--user-agent=${profile.fingerprint.userAgent}`);
         }
         if (hasLanguageOverride) {
@@ -5390,147 +5546,12 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         const getRuntimeLanguageState = () => {
             return buildRuntimeLanguageState(runtimeFingerprint);
         };
-        let fingerprintInjectScript = getInjectScript(runtimeFingerprint, profile.name, style);
-        const watermarkInjectScript = getWatermarkScript(profile.name, style);
-        const enableWebglOverride = !!(
-            profile.fingerprint?.webglProfile !== 'none' &&
-            profile.fingerprint?.webgl &&
-            !profile.fingerprint?.webgl?.disabled
-        );
-        const webglOverrideScript = (() => {
-            if (!enableWebglOverride) return '(()=>{})();';
-            const webglJson = JSON.stringify(profile.fingerprint?.webgl || {});
-            return `
-(() => {
-  try {
-    const isGoogleAuthPage = (() => {
-      const isAuthHost = (host) => {
-        const value = String(host || '').toLowerCase();
-        return value === 'accounts.google.com' ||
-          value.endsWith('.accounts.google.com') ||
-          value === 'accounts.youtube.com' ||
-          value.endsWith('.accounts.youtube.com');
-      };
-      try {
-        const host = String(location.hostname || '').toLowerCase();
-        const path = String(location.pathname || '').toLowerCase();
-        if (isAuthHost(host)) return true;
-        if ((host === 'google.com' || host === 'www.google.com') && path.startsWith('/recaptcha/')) return true;
-      } catch (e) {}
-      try {
-        const ancestors = location.ancestorOrigins;
-        if (ancestors && typeof ancestors.length === 'number') {
-          for (let i = 0; i < ancestors.length; i += 1) {
-            try {
-              if (isAuthHost(new URL(ancestors[i]).hostname)) return true;
-            } catch (e) {}
-          }
-        }
-      } catch (e) {}
-      try {
-        if (document.referrer && isAuthHost(new URL(document.referrer).hostname)) return true;
-      } catch (e) {}
-      return false;
-    })();
-    if (isGoogleAuthPage) return;
 
-    const webglInfo = ${webglJson};
-    const PATCHED_KEY = '__geekezDirectWebglPatched__';
-    const debugExt = { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
-
-    const caps = (() => {
-      const renderer = String(webglInfo.unmaskedRenderer || webglInfo.renderer || '').toLowerCase();
-      const vendor = String(webglInfo.unmaskedVendor || webglInfo.vendor || '').toLowerCase();
-      const isHigh = renderer.includes('apple') || renderer.includes('nvidia') || renderer.includes('amd') || renderer.includes('radeon') || vendor.includes('apple') || vendor.includes('nvidia') || vendor.includes('ati');
-      const texture = isHigh ? 32768 : 16384;
-      const vertexUniforms = isHigh ? 4096 : 2048;
-      const fragmentUniforms = isHigh ? 2048 : 1024;
-      const varying = isHigh ? 32 : 30;
-      return {
-        3379: texture,
-        34076: texture,
-        34024: texture,
-        34921: 16,
-        34930: 16,
-        35660: 16,
-        35661: 32,
-        36347: vertexUniforms,
-        36348: varying,
-        36349: fragmentUniforms,
-        3386: new Int32Array([texture, texture]),
-        33901: new Float32Array([1, 1024]),
-        33902: new Float32Array([1, 1]),
-        34852: 8,
-        36063: 8
-      };
-    })();
-
-    const cloneCap = (value) => {
-      if (value instanceof Int32Array) return new Int32Array(value);
-      if (value instanceof Float32Array) return new Float32Array(value);
-      return value;
-    };
-
-    const patchProto = (proto) => {
-      if (!proto || proto[PATCHED_KEY]) return;
-      try {
-        const originalGetParameter = proto.getParameter;
-        const originalGetExtension = proto.getExtension;
-        const originalGetSupportedExtensions = proto.getSupportedExtensions;
-        proto.getParameter = function(param) {
-          if (param === 37445) return webglInfo.unmaskedVendor || webglInfo.vendor || 'Google Inc.';
-          if (param === 37446) return webglInfo.unmaskedRenderer || webglInfo.renderer || 'ANGLE (Unknown GPU)';
-          if (param === 7936) return webglInfo.vendor || 'Google Inc.';
-          if (param === 7937) return webglInfo.renderer || 'ANGLE (Unknown GPU)';
-          if (param === 7938) return webglInfo.version || 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
-          if (param === 35724) return webglInfo.shadingLanguageVersion || 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
-          if (Object.prototype.hasOwnProperty.call(caps, param)) return cloneCap(caps[param]);
-          return originalGetParameter.apply(this, arguments);
-        };
-        proto.getExtension = function(name) {
-          if (name === 'WEBGL_debug_renderer_info') return debugExt;
-          return originalGetExtension.apply(this, arguments);
-        };
-        if (originalGetSupportedExtensions) {
-          proto.getSupportedExtensions = function() {
-            const list = originalGetSupportedExtensions.apply(this, arguments) || [];
-            if (Array.isArray(list) && !list.includes('WEBGL_debug_renderer_info')) return list.concat(['WEBGL_debug_renderer_info']);
-            return list;
-          };
-        }
-        Object.defineProperty(proto, PATCHED_KEY, { value: true, configurable: true });
-      } catch (e) {}
-    };
-
-    const patchFactory = (factoryProto) => {
-      if (!factoryProto || !factoryProto.getContext || factoryProto.__geekezCtxPatched__) return;
-      try {
-        const originalGetContext = factoryProto.getContext;
-        factoryProto.getContext = function(type) {
-          const ctx = originalGetContext.apply(this, arguments);
-          const name = String(type || '').toLowerCase();
-          if (name === 'webgl' || name === 'experimental-webgl' || name === 'webgl2') {
-            try { patchProto(Object.getPrototypeOf(ctx)); } catch (e) {}
-          }
-          return ctx;
-        };
-        Object.defineProperty(factoryProto, '__geekezCtxPatched__', { value: true, configurable: true });
-      } catch (e) {}
-    };
-
-    patchProto(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype);
-    patchProto(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype);
-    patchFactory(window.HTMLCanvasElement && window.HTMLCanvasElement.prototype);
-    patchFactory(window.OffscreenCanvas && window.OffscreenCanvas.prototype);
-  } catch (e) {}
-})();
-            `;
-        })();
-
-        // Keep network headers, Intl locale and runtime fingerprint hooks aligned with profile settings.
+        // GeekEZ Guard is the single source for page-world fingerprint hooks. CDP only
+        // aligns network headers, locale and timezone with the resolved profile.
         const applySessionOverrides = async (session, options = {}) => {
             if (!session) return;
-            const { includeScripts = false, url = '' } = options;
+            const { url = '' } = options;
             const runtimeLanguage = getRuntimeLanguageState();
             // Apply native locale/timezone overrides while the startup page is still
             // blank. Deferring them until after navigation creates a detectable
@@ -5541,15 +5562,6 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 !isAutoTimezoneValue(runtimeFingerprint.timezone) &&
                 !isNoOverrideValue(runtimeFingerprint.timezone)
             );
-
-            if (includeScripts) {
-                try {
-                    await session.send('Page.enable');
-                    await session.send('Page.addScriptToEvaluateOnNewDocument', { source: fingerprintInjectScript });
-                    await session.send('Page.addScriptToEvaluateOnNewDocument', { source: watermarkInjectScript });
-                    await session.send('Page.addScriptToEvaluateOnNewDocument', { source: webglOverrideScript });
-                } catch (e) { }
-            }
 
             try { await session.send('Network.enable'); } catch (e) { }
 
@@ -5587,7 +5599,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 } catch (e) { }
             }
 
-            if (profile.fingerprint?.userAgent) {
+            if (uaSpoofEnabled && profile.fingerprint?.userAgent) {
                 const payload = {
                     userAgent: profile.fingerprint.userAgent
                 };
@@ -5629,11 +5641,10 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             return session;
         };
 
-        const applyPageRuntimeOverrides = async (page, includeScripts = false) => {
+        const applyPageRuntimeOverrides = async (page) => {
             if (!page) return;
             const session = await getPageOverrideSession(page);
             await applySessionOverrides(session, {
-                includeScripts,
                 url: typeof page.url === 'function' ? page.url() : ''
             });
         };
@@ -5654,32 +5665,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             if (!page) return;
             try {
                 watchPageRuntimeOverrideNavigation(page);
-                const currentUrl = typeof page.url === 'function' ? page.url() : '';
-                const shouldEvaluateCurrentPage = !isGoogleAuthLikeUrl(currentUrl) && !isPreNavigationUrl(currentUrl);
-
-                try {
-                    await page.evaluateOnNewDocument(fingerprintInjectScript);
-                } catch (e) { }
-                try {
-                    await page.evaluateOnNewDocument(watermarkInjectScript);
-                } catch (e) { }
-                try {
-                    await page.evaluateOnNewDocument(webglOverrideScript);
-                } catch (e) { }
-
-                if (shouldEvaluateCurrentPage) {
-                    try {
-                        await page.evaluate(fingerprintInjectScript);
-                    } catch (e) { }
-                    try {
-                        await page.evaluate(watermarkInjectScript);
-                    } catch (e) { }
-                    try {
-                        await page.evaluate(webglOverrideScript);
-                    } catch (e) { }
-                }
-
-                await applyPageRuntimeOverrides(page, true);
+                await applyPageRuntimeOverrides(page);
             } catch (err) {
                 const msg = String(err && err.message ? err.message : '');
                 if (msg.includes('No target with given id found') || msg.includes('Target closed')) {
@@ -5776,9 +5762,15 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         activeProcesses[profileId] = {
             xrayPid: xrayProcess ? xrayProcess.pid : null,
+            xrayProcess,
+            xrayConfigPath,
+            localPort,
             browser,
-            logFd: logFd  // 存储日志文件描述符，用于后续关闭
+            logFd,
+            recoveringProxy: false,
+            stopping: false
         };
+        if (xrayProcess) attachXrayExitRecovery(profileId, xrayProcess);
         launchingProfiles.delete(profileId);
         updateLaunchProgress(
             100,
@@ -5820,8 +5812,10 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         browser.on('disconnected', async () => {
             if (activeProcesses[profileId]) {
-                const pid = activeProcesses[profileId].xrayPid;
-                const logFd = activeProcesses[profileId].logFd;
+                const proc = activeProcesses[profileId];
+                proc.stopping = true;
+                const pid = proc.xrayPid;
+                const logFd = proc.logFd;
 
                 // 关闭日志文件描述符
                 if (logFd !== undefined) {
@@ -5882,6 +5876,9 @@ ipcMain.handle('launch-profile', launchProfileHandler);
 
 app.on('before-quit', () => {
     isAppQuitting = true;
+    Object.values(activeProcesses).forEach((proc) => {
+        proc.stopping = true;
+    });
 });
 
 app.on('window-all-closed', () => {

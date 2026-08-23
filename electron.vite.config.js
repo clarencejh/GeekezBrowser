@@ -13,7 +13,12 @@ export default defineConfig({
           'close-behavior': resolve(__dirname, 'src/main/close-behavior.js'),
           'native-glass': resolve(__dirname, 'src/main/native-glass.js'),
           'xray-assets': resolve(__dirname, 'src/main/xray-assets.js'),
-          'release-check': resolve(__dirname, 'src/main/release-check.js')
+          'release-check': resolve(__dirname, 'src/main/release-check.js'),
+          'local-proxy-port': resolve(__dirname, 'src/main/local-proxy-port.js'),
+          'audio-noise': resolve(__dirname, 'src/main/audio-noise.js'),
+          'canvas-noise': resolve(__dirname, 'src/main/canvas-noise.js'),
+          'media-device-profile': resolve(__dirname, 'src/main/media-device-profile.js'),
+          'voice-profile': resolve(__dirname, 'src/main/voice-profile.js')
         }
       }
     }

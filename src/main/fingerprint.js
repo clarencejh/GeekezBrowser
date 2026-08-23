@@ -1,6 +1,10 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const { applyStableAudioNoise } = require('./audio-noise');
+const { applyStableCanvasNoise } = require('./canvas-noise');
+const { selectStableMediaDevices } = require('./media-device-profile');
+const { selectStableVoices } = require('./voice-profile');
 
 const RESOLUTIONS = [
     { w: 1920, h: 1080 },
@@ -783,6 +787,10 @@ function generateFingerprint(options = {}) {
 function getInjectScript(fp, profileName, watermarkStyle) {
     const normalizedFp = generateFingerprint(fp || {});
     const fpJson = JSON.stringify(normalizedFp);
+    const stableAudioNoiseSource = applyStableAudioNoise.toString();
+    const stableCanvasNoiseSource = applyStableCanvasNoise.toString();
+    const stableMediaDeviceSelectorSource = selectStableMediaDevices.toString();
+    const stableVoiceSelectorSource = selectStableVoices.toString();
     const safeProfileName = (profileName || 'Profile').replace(/[<>"'&]/g, '');
     const style = watermarkStyle === 'banner' || watermarkStyle === 'off' ? watermarkStyle : 'enhanced';
 
@@ -821,35 +829,57 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             })();
             if (isGoogleAuthPage) return;
 
-            const makeNative = (func, name) => {
-                const nativeStr = 'function ' + name + '() { [native code] }';
-                Object.defineProperty(func, 'toString', {
-                    value: function() { return nativeStr; },
-                    configurable: true,
-                    writable: true
+            const nativeFunctionStrings = new WeakMap();
+            const originalFunctionToString = Function.prototype.toString;
+            const originalToStringDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, 'toString');
+            const patchedFunctionToString = new Proxy(originalFunctionToString, {
+                apply(target, thisArg, args) {
+                    if (nativeFunctionStrings.has(thisArg)) {
+                        return nativeFunctionStrings.get(thisArg);
+                    }
+                    return Reflect.apply(target, thisArg, args);
+                }
+            });
+            nativeFunctionStrings.set(
+                patchedFunctionToString,
+                Reflect.apply(originalFunctionToString, originalFunctionToString, [])
+            );
+            try {
+                Object.defineProperty(Function.prototype, 'toString', {
+                    ...originalToStringDescriptor,
+                    value: patchedFunctionToString
                 });
-                Object.defineProperty(func.toString, 'toString', {
-                    value: function() { return 'function toString() { [native code] }'; },
-                    configurable: true,
-                    writable: true
-                });
+            } catch (e) { }
+
+            const makeNative = (func, name, original) => {
+                let nativeStr = 'function ' + name + '() { [native code] }';
+                if (typeof original === 'function') {
+                    try {
+                        nativeStr = Reflect.apply(originalFunctionToString, original, []);
+                    } catch (e) { }
+                }
+                nativeFunctionStrings.set(func, nativeStr);
                 return func;
             };
 
             const defineValueGetter = (target, key, value, nativeName) => {
                 if (!target) return;
                 try {
-                    const getter = makeNative(function() { return value; }, nativeName || key);
+                    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+                    const getter = makeNative(function() { return value; }, nativeName || key, descriptor && descriptor.get);
                     Object.defineProperty(target, key, {
                         get: getter,
-                        configurable: true
+                        configurable: descriptor ? descriptor.configurable : true,
+                        enumerable: descriptor ? descriptor.enumerable : true
                     });
                 } catch (e) { }
             };
 
+            const enableUaSpoof = fp.uaMode !== 'none';
+            const enableWebglSpoof = !!(fp.webgl && !fp.webgl.disabled && fp.webglProfile !== 'none');
+
             // --- 1. Basic automation markers cleanup ---
             try {
-                defineValueGetter(Navigator.prototype, 'webdriver', false, 'get webdriver');
                 const cdcRegex = /cdc_[a-zA-Z0-9]+/;
                 Object.keys(window).forEach((key) => {
                     if (cdcRegex.test(key)) {
@@ -886,12 +916,13 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             if (fp.screen && fp.screen.width && fp.screen.height) {
                 const screenWidth = fp.screen.width;
                 const screenHeight = fp.screen.height;
-                defineValueGetter(screen, 'width', screenWidth, 'get width');
-                defineValueGetter(screen, 'height', screenHeight, 'get height');
-                defineValueGetter(screen, 'availWidth', screenWidth, 'get availWidth');
-                defineValueGetter(screen, 'availHeight', Math.max(0, screenHeight - 40), 'get availHeight');
-                defineValueGetter(window, 'outerWidth', screenWidth, 'get outerWidth');
-                defineValueGetter(window, 'outerHeight', screenHeight, 'get outerHeight');
+                const availWidthInset = Math.max(0, Number(screen.width || 0) - Number(screen.availWidth || 0));
+                const availHeightInset = Math.max(0, Number(screen.height || 0) - Number(screen.availHeight || 0));
+                const screenPrototype = window.Screen?.prototype || Object.getPrototypeOf(screen);
+                defineValueGetter(screenPrototype, 'width', screenWidth, 'get width');
+                defineValueGetter(screenPrototype, 'height', screenHeight, 'get height');
+                defineValueGetter(screenPrototype, 'availWidth', Math.max(0, screenWidth - availWidthInset), 'get availWidth');
+                defineValueGetter(screenPrototype, 'availHeight', Math.max(0, screenHeight - availHeightInset), 'get availHeight');
             }
 
             if (fp.hardwareConcurrency) {
@@ -903,7 +934,6 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             }
 
             // --- 3. UA and User-Agent Client Hints spoof ---
-            const enableUaSpoof = fp.uaMode !== 'none';
             const targetUa = (enableUaSpoof && fp.userAgent) ? fp.userAgent : navigator.userAgent;
             const targetMeta = fp.userAgentMetadata || {};
             const targetPlatform = fp.platform || navigator.platform;
@@ -990,17 +1020,18 @@ function getInjectScript(fp, profileName, watermarkStyle) {
 
                 try {
                     if (navigator.geolocation) {
-                        navigator.geolocation.getCurrentPosition = fakeGetCurrentPosition;
-                        navigator.geolocation.watchPosition = fakeWatchPosition;
+                        navigator.geolocation.getCurrentPosition = makeNative(fakeGetCurrentPosition, 'getCurrentPosition');
+                        navigator.geolocation.watchPosition = makeNative(fakeWatchPosition, 'watchPosition');
                         if (typeof navigator.geolocation.clearWatch === 'function') {
                             const originalClearWatch = navigator.geolocation.clearWatch;
-                            navigator.geolocation.clearWatch = function clearWatch(watchId) {
+                            const fakeClearWatch = function clearWatch(watchId) {
                                 try {
                                     return originalClearWatch.call(navigator.geolocation, watchId);
                                 } catch (e) {
                                     return undefined;
                                 }
                             };
+                            navigator.geolocation.clearWatch = makeNative(fakeClearWatch, 'clearWatch', originalClearWatch);
                         }
                     }
                 } catch (e) { }
@@ -1008,40 +1039,171 @@ function getInjectScript(fp, profileName, watermarkStyle) {
 
             // --- 5. Canvas and Audio noise ---
             try {
-                const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-                const hookedGetImageData = function getImageData(x, y, w, h) {
-                    const imageData = originalGetImageData.apply(this, arguments);
-                    if (fp.noiseSeed) {
-                        for (let i = 0; i < imageData.data.length; i += 4) {
-                            if ((i + fp.noiseSeed) % 53 === 0) {
-                                const noise = fp.canvasNoise ? (fp.canvasNoise.a || 0) : 0;
-                                imageData.data[i + 3] = Math.max(0, Math.min(255, imageData.data[i + 3] + noise));
-                            }
-                        }
-                    }
-                    return imageData;
+                const applyCanvasNoise = ${stableCanvasNoiseSource};
+                const originalImageDataReaders = new WeakMap();
+                const patched2DContextPrototypes = new WeakSet();
+
+                const patch2DContextPrototype = (contextPrototype) => {
+                    if (!contextPrototype || patched2DContextPrototypes.has(contextPrototype)) return;
+                    const originalGetImageData = contextPrototype.getImageData;
+                    if (typeof originalGetImageData !== 'function') return;
+                    originalImageDataReaders.set(contextPrototype, originalGetImageData);
+
+                    const hookedGetImageData = function getImageData(x, y, w, h) {
+                        const imageData = originalGetImageData.apply(this, arguments);
+                        const canvas = this && this.canvas;
+                        applyCanvasNoise(
+                            imageData.data,
+                            imageData.width,
+                            imageData.height,
+                            fp.noiseSeed,
+                            fp.canvasNoise,
+                            x,
+                            y,
+                            canvas && canvas.width ? canvas.width : imageData.width
+                        );
+                        return imageData;
+                    };
+                    contextPrototype.getImageData = makeNative(hookedGetImageData, 'getImageData', originalGetImageData);
+                    patched2DContextPrototypes.add(contextPrototype);
                 };
-                CanvasRenderingContext2D.prototype.getImageData = makeNative(hookedGetImageData, 'getImageData');
+
+                patch2DContextPrototype(window.CanvasRenderingContext2D && window.CanvasRenderingContext2D.prototype);
+                patch2DContextPrototype(window.OffscreenCanvasRenderingContext2D && window.OffscreenCanvasRenderingContext2D.prototype);
+
+                const noiseCanvasCopy = (sourceCanvas, createCanvas, getContext) => {
+                    const width = Math.max(0, Number(sourceCanvas && sourceCanvas.width) || 0);
+                    const height = Math.max(0, Number(sourceCanvas && sourceCanvas.height) || 0);
+                    if (!width || !height) return null;
+
+                    const copy = createCanvas(width, height);
+                    const context = getContext(copy);
+                    if (!context) return null;
+                    context.drawImage(sourceCanvas, 0, 0);
+
+                    const contextPrototype = Object.getPrototypeOf(context);
+                    const originalGetImageData = originalImageDataReaders.get(contextPrototype) || contextPrototype.getImageData;
+                    if (typeof originalGetImageData !== 'function') return null;
+                    const imageData = originalGetImageData.call(context, 0, 0, width, height);
+                    applyCanvasNoise(imageData.data, width, height, fp.noiseSeed, fp.canvasNoise, 0, 0, width);
+                    context.putImageData(imageData, 0, 0);
+                    return copy;
+                };
+
+                if (window.HTMLCanvasElement && window.HTMLCanvasElement.prototype) {
+                    const canvasPrototype = window.HTMLCanvasElement.prototype;
+                    const originalGetContext = canvasPrototype.getContext;
+                    const originalToDataURL = canvasPrototype.toDataURL;
+                    const originalToBlob = canvasPrototype.toBlob;
+                    const createHtmlCanvasCopy = (width, height) => {
+                        const copy = document.createElement('canvas');
+                        copy.width = width;
+                        copy.height = height;
+                        return copy;
+                    };
+                    const getHtmlCanvasContext = (canvas) => originalGetContext.call(canvas, '2d', { willReadFrequently: true });
+
+                    if (typeof originalToDataURL === 'function') {
+                        const hookedToDataURL = function toDataURL() {
+                            try {
+                                const copy = noiseCanvasCopy(this, createHtmlCanvasCopy, getHtmlCanvasContext);
+                                if (copy) return originalToDataURL.apply(copy, arguments);
+                            } catch (e) { }
+                            return originalToDataURL.apply(this, arguments);
+                        };
+                        canvasPrototype.toDataURL = makeNative(hookedToDataURL, 'toDataURL', originalToDataURL);
+                    }
+
+                    if (typeof originalToBlob === 'function') {
+                        const hookedToBlob = function toBlob() {
+                            try {
+                                const copy = noiseCanvasCopy(this, createHtmlCanvasCopy, getHtmlCanvasContext);
+                                if (copy) return originalToBlob.apply(copy, arguments);
+                            } catch (e) { }
+                            return originalToBlob.apply(this, arguments);
+                        };
+                        canvasPrototype.toBlob = makeNative(hookedToBlob, 'toBlob', originalToBlob);
+                    }
+                }
+
+                if (window.OffscreenCanvas && window.OffscreenCanvas.prototype) {
+                    const offscreenPrototype = window.OffscreenCanvas.prototype;
+                    const originalOffscreenGetContext = offscreenPrototype.getContext;
+                    const originalConvertToBlob = offscreenPrototype.convertToBlob;
+                    if (typeof originalOffscreenGetContext === 'function' && typeof originalConvertToBlob === 'function') {
+                        const hookedConvertToBlob = function convertToBlob() {
+                            try {
+                                const copy = noiseCanvasCopy(
+                                    this,
+                                    (width, height) => new OffscreenCanvas(width, height),
+                                    (canvas) => originalOffscreenGetContext.call(canvas, '2d', { willReadFrequently: true })
+                                );
+                                if (copy) return originalConvertToBlob.apply(copy, arguments);
+                            } catch (e) { }
+                            return originalConvertToBlob.apply(this, arguments);
+                        };
+                        offscreenPrototype.convertToBlob = makeNative(hookedConvertToBlob, 'convertToBlob', originalConvertToBlob);
+                    }
+                }
             } catch (e) { }
 
             try {
                 const originalGetChannelData = AudioBuffer.prototype.getChannelData;
+                const seenAudioChannels = new WeakSet();
+                const applyAudioNoise = ${stableAudioNoiseSource};
                 const hookedGetChannelData = function getChannelData(channel) {
                     const results = originalGetChannelData.apply(this, arguments);
-                    const noise = fp.audioNoise || 0.0000001;
-                    for (let i = 0; i < 100 && i < results.length; i++) {
-                        results[i] = results[i] + noise;
+                    if (!seenAudioChannels.has(results)) {
+                        seenAudioChannels.add(results);
+                        applyAudioNoise(results, fp.noiseSeed, fp.audioNoise, channel);
                     }
                     return results;
                 };
-                AudioBuffer.prototype.getChannelData = makeNative(hookedGetChannelData, 'getChannelData');
+                AudioBuffer.prototype.getChannelData = makeNative(hookedGetChannelData, 'getChannelData', originalGetChannelData);
+            } catch (e) { }
+
+            try {
+                const speechInstance = window.speechSynthesis;
+                const speechPrototype = (window.SpeechSynthesis && window.SpeechSynthesis.prototype) ||
+                    (speechInstance && Object.getPrototypeOf(speechInstance));
+                const originalGetVoices = speechPrototype && speechPrototype.getVoices;
+                if (typeof originalGetVoices === 'function') {
+                    const chooseVoices = ${stableVoiceSelectorSource};
+                    const targetVoiceLanguage = fp.language && fp.language !== 'none' && fp.language !== 'auto'
+                        ? fp.language
+                        : navigator.language;
+                    const hookedGetVoices = function getVoices() {
+                        const voices = originalGetVoices.apply(this, arguments);
+                        return chooseVoices(voices, fp.noiseSeed, targetVoiceLanguage);
+                    };
+                    speechPrototype.getVoices = makeNative(hookedGetVoices, 'getVoices', originalGetVoices);
+                }
+            } catch (e) { }
+
+            try {
+                const mediaDevices = navigator.mediaDevices;
+                const mediaDevicesPrototype = (window.MediaDevices && window.MediaDevices.prototype) ||
+                    (mediaDevices && Object.getPrototypeOf(mediaDevices));
+                const originalEnumerateDevices = mediaDevicesPrototype && mediaDevicesPrototype.enumerateDevices;
+                if (typeof originalEnumerateDevices === 'function') {
+                    const chooseMediaDevices = ${stableMediaDeviceSelectorSource};
+                    const hookedEnumerateDevices = async function enumerateDevices() {
+                        const devices = await originalEnumerateDevices.apply(this, arguments);
+                        return chooseMediaDevices(devices, fp.noiseSeed);
+                    };
+                    mediaDevicesPrototype.enumerateDevices = makeNative(
+                        hookedEnumerateDevices,
+                        'enumerateDevices',
+                        originalEnumerateDevices
+                    );
+                }
             } catch (e) { }
 
             // --- 7. WebGL spoof ---
-            const enableWebglSpoof = !!(fp.webgl && !fp.webgl.disabled && fp.webglProfile !== 'none');
             if (enableWebglSpoof || enableUaSpoof) {
             const webglInfo = fp.webgl || {};
-            const PATCHED_WEBGL_PROTO_KEY = '__geekezWebglPatched__';
+            const patchedWebglPrototypes = new WeakSet();
+            const patchedContextFactories = new WeakSet();
             const debugExt = {
                 UNMASKED_VENDOR_WEBGL: 37445,
                 UNMASKED_RENDERER_WEBGL: 37446
@@ -1102,7 +1264,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             };
 
             const hookWebGLPrototype = (proto) => {
-                if (!proto || proto[PATCHED_WEBGL_PROTO_KEY]) return;
+                if (!proto || patchedWebglPrototypes.has(proto)) return;
                 try {
                     const originalGetParameter = proto.getParameter;
                     const originalGetExtension = proto.getExtension;
@@ -1137,10 +1299,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                     if (originalGetSupportedExtensions) {
                         proto.getSupportedExtensions = makeNative(hookedGetSupportedExtensions, 'getSupportedExtensions');
                     }
-                    Object.defineProperty(proto, PATCHED_WEBGL_PROTO_KEY, {
-                        value: true,
-                        configurable: true
-                    });
+                    patchedWebglPrototypes.add(proto);
                 } catch (e) { }
             };
 
@@ -1153,7 +1312,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             };
 
             const hookCanvasContextFactory = (canvasProto) => {
-                if (!canvasProto || !canvasProto.getContext) return;
+                if (!canvasProto || !canvasProto.getContext || patchedContextFactories.has(canvasProto)) return;
                 try {
                     const originalGetContext = canvasProto.getContext;
                     canvasProto.getContext = makeNative(function getContext(type) {
@@ -1163,7 +1322,8 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                             return patchContextIfNeeded(context);
                         }
                         return context;
-                    }, 'getContext');
+                    }, 'getContext', originalGetContext);
+                    patchedContextFactories.add(canvasProto);
                 } catch (e) { }
             };
 
@@ -1174,9 +1334,9 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                 hookCanvasContextFactory(window.OffscreenCanvas && window.OffscreenCanvas.prototype);
             }
 
-            // --- 7.1 WebGPU alignment ---
+            // --- 7.1 WebGPU metadata alignment ---
             // Some detectors compare WebGL renderer with WebGPU adapter info.
-            // Keep WebGPU adapter metadata aligned with selected WebGL profile.
+            // Preserve native info prototypes, capabilities and device behavior.
             const patchGpuAdapter = (gpuObj) => {
                 if (!gpuObj || typeof gpuObj.requestAdapter !== 'function') return;
                 try {
@@ -1193,7 +1353,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                         return vendorText || 'Unknown';
                     };
 
-                    const fakeAdapterInfo = Object.freeze({
+                    const adapterInfoOverrides = Object.freeze({
                         vendor: guessVendor(),
                         architecture: guessVendor(),
                         device: rendererText || 'Generic GPU',
@@ -1201,20 +1361,50 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                     });
 
                     const originalRequestAdapter = gpuObj.requestAdapter.bind(gpuObj);
-                    const wrapAdapter = (adapter) => {
-                        if (!adapter || typeof adapter !== 'object') return adapter;
-                        return new Proxy(adapter, {
-                            get(target, prop, receiver) {
-                                if (prop === 'requestAdapterInfo') {
-                                    return makeNative(async function requestAdapterInfo() {
-                                        return fakeAdapterInfo;
-                                    }, 'requestAdapterInfo');
+                    const adapterProxies = new WeakMap();
+                    const adapterInfoProxies = new WeakMap();
+                    const wrapAdapterInfo = (info) => {
+                        if (!info || typeof info !== 'object') return info;
+                        if (adapterInfoProxies.has(info)) return adapterInfoProxies.get(info);
+                        const proxy = new Proxy(info, {
+                            get(target, prop) {
+                                if (Object.prototype.hasOwnProperty.call(adapterInfoOverrides, prop)) {
+                                    return adapterInfoOverrides[prop];
                                 }
-                                if (prop === 'info') return fakeAdapterInfo;
-                                const value = Reflect.get(target, prop, receiver);
+                                const value = Reflect.get(target, prop, target);
                                 return typeof value === 'function' ? value.bind(target) : value;
                             }
                         });
+                        adapterInfoProxies.set(info, proxy);
+                        return proxy;
+                    };
+                    const wrapAdapter = (adapter) => {
+                        if (!adapter || typeof adapter !== 'object') return adapter;
+                        if (adapterProxies.has(adapter)) return adapterProxies.get(adapter);
+                        const boundMethods = new Map();
+                        let requestAdapterInfoWrapper = null;
+                        const proxy = new Proxy(adapter, {
+                            get(target, prop, receiver) {
+                                if (prop === 'requestAdapterInfo') {
+                                    const original = Reflect.get(target, prop, target);
+                                    if (typeof original !== 'function') return original;
+                                    if (!requestAdapterInfoWrapper) {
+                                        requestAdapterInfoWrapper = makeNative(async function requestAdapterInfo() {
+                                            const info = await original.apply(target, arguments);
+                                            return wrapAdapterInfo(info);
+                                        }, 'requestAdapterInfo', original);
+                                    }
+                                    return requestAdapterInfoWrapper;
+                                }
+                                if (prop === 'info') return wrapAdapterInfo(Reflect.get(target, prop, target));
+                                const value = Reflect.get(target, prop, target);
+                                if (typeof value !== 'function') return value;
+                                if (!boundMethods.has(prop)) boundMethods.set(prop, value.bind(target));
+                                return boundMethods.get(prop);
+                            }
+                        });
+                        adapterProxies.set(adapter, proxy);
+                        return proxy;
                     };
 
                     const hookedRequestAdapter = async function requestAdapter(options) {
@@ -1239,8 +1429,8 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             }
 
             // --- 7.2 Worker realm bridge ---
-            // BrowserScan/PixelScan can read GPU/UA from dedicated workers.
-            // Inject the same spoofing into worker contexts via constructor wrappers.
+            // BrowserScan/PixelScan can read Canvas, hardware, GPU and UA from workers.
+            // Inject the same profile into worker contexts via constructor wrappers.
             try {
                 const buildWorkerBootstrap = (sourceUrl, isModule) => {
                     const payload = JSON.stringify({
@@ -1249,19 +1439,45 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                         userAgent: targetUa,
                         userAgentMetadata: targetMeta,
                         platform: targetPlatform,
+                        hardwareConcurrency: fp.hardwareConcurrency,
+                        deviceMemory: fp.deviceMemory,
+                        noiseSeed: fp.noiseSeed,
+                        canvasNoise: fp.canvasNoise,
                         webgl: webglInfo
                     });
 
                     const workerPatch = function(workerPayload) {
                         try {
-                            const makeNative = (func, name) => {
-                                const nativeStr = 'function ' + name + '() { [native code] }';
-                                try {
-                                    Object.defineProperty(func, 'toString', {
-                                        value: function() { return nativeStr; },
-                                        configurable: true
-                                    });
-                                } catch (e) { }
+                            const nativeFunctionStrings = new WeakMap();
+                            const originalFunctionToString = Function.prototype.toString;
+                            const originalToStringDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, 'toString');
+                            const patchedFunctionToString = new Proxy(originalFunctionToString, {
+                                apply(target, thisArg, args) {
+                                    if (nativeFunctionStrings.has(thisArg)) {
+                                        return nativeFunctionStrings.get(thisArg);
+                                    }
+                                    return Reflect.apply(target, thisArg, args);
+                                }
+                            });
+                            nativeFunctionStrings.set(
+                                patchedFunctionToString,
+                                Reflect.apply(originalFunctionToString, originalFunctionToString, [])
+                            );
+                            try {
+                                Object.defineProperty(Function.prototype, 'toString', {
+                                    ...originalToStringDescriptor,
+                                    value: patchedFunctionToString
+                                });
+                            } catch (e) { }
+
+                            const makeNative = (func, name, original) => {
+                                let nativeStr = 'function ' + name + '() { [native code] }';
+                                if (typeof original === 'function') {
+                                    try {
+                                        nativeStr = Reflect.apply(originalFunctionToString, original, []);
+                                    } catch (e) { }
+                                }
+                                nativeFunctionStrings.set(func, nativeStr);
                                 return func;
                             };
 
@@ -1276,6 +1492,78 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                             const nav = self.navigator || {};
                             const navProto = Object.getPrototypeOf(nav);
                             const targetPlatform = workerPayload.platform || '';
+
+                            if (workerPayload.hardwareConcurrency) {
+                                defineGetter(navProto, 'hardwareConcurrency', workerPayload.hardwareConcurrency, 'get hardwareConcurrency');
+                            }
+                            if (workerPayload.deviceMemory) {
+                                defineGetter(navProto, 'deviceMemory', workerPayload.deviceMemory, 'get deviceMemory');
+                            }
+
+                            // Keep Worker OffscreenCanvas reads aligned with the page realm.
+                            try {
+                                const contextPrototype = self.OffscreenCanvasRenderingContext2D && self.OffscreenCanvasRenderingContext2D.prototype;
+                                const offscreenPrototype = self.OffscreenCanvas && self.OffscreenCanvas.prototype;
+                                const originalGetImageData = contextPrototype && contextPrototype.getImageData;
+                                const originalPutImageData = contextPrototype && contextPrototype.putImageData;
+                                const originalOffscreenGetContext = offscreenPrototype && offscreenPrototype.getContext;
+                                const originalConvertToBlob = offscreenPrototype && offscreenPrototype.convertToBlob;
+
+                                if (typeof originalGetImageData === 'function') {
+                                    const hookedGetImageData = function getImageData(x, y, w, h) {
+                                        const imageData = originalGetImageData.apply(this, arguments);
+                                        const canvas = this && this.canvas;
+                                        applyCanvasNoise(
+                                            imageData.data,
+                                            imageData.width,
+                                            imageData.height,
+                                            workerPayload.noiseSeed,
+                                            workerPayload.canvasNoise,
+                                            x,
+                                            y,
+                                            canvas && canvas.width ? canvas.width : imageData.width
+                                        );
+                                        return imageData;
+                                    };
+                                    contextPrototype.getImageData = makeNative(hookedGetImageData, 'getImageData', originalGetImageData);
+                                }
+
+                                if (
+                                    typeof originalGetImageData === 'function' &&
+                                    typeof originalPutImageData === 'function' &&
+                                    typeof originalOffscreenGetContext === 'function' &&
+                                    typeof originalConvertToBlob === 'function'
+                                ) {
+                                    const hookedConvertToBlob = function convertToBlob() {
+                                        try {
+                                            const width = Math.max(0, Number(this && this.width) || 0);
+                                            const height = Math.max(0, Number(this && this.height) || 0);
+                                            if (width && height) {
+                                                const copy = new OffscreenCanvas(width, height);
+                                                const context = originalOffscreenGetContext.call(copy, '2d', { willReadFrequently: true });
+                                                if (context) {
+                                                    context.drawImage(this, 0, 0);
+                                                    const imageData = originalGetImageData.call(context, 0, 0, width, height);
+                                                    applyCanvasNoise(
+                                                        imageData.data,
+                                                        width,
+                                                        height,
+                                                        workerPayload.noiseSeed,
+                                                        workerPayload.canvasNoise,
+                                                        0,
+                                                        0,
+                                                        width
+                                                    );
+                                                    originalPutImageData.call(context, imageData, 0, 0);
+                                                    return originalConvertToBlob.apply(copy, arguments);
+                                                }
+                                            }
+                                        } catch (e) { }
+                                        return originalConvertToBlob.apply(this, arguments);
+                                    };
+                                    offscreenPrototype.convertToBlob = makeNative(hookedConvertToBlob, 'convertToBlob', originalConvertToBlob);
+                                }
+                            } catch (e) { }
 
                             const enableWorkerUaSpoof = workerPayload.uaMode !== 'none';
                             if (enableWorkerUaSpoof) {
@@ -1324,7 +1612,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                             const enableWorkerWebglSpoof = !!workerPayload.enableWebglSpoof;
                             if (enableWorkerWebglSpoof) {
                                 const workerWebgl = workerPayload.webgl || {};
-                                const patchKey = '__geekezWebglPatched__';
+                                const patchedWebglPrototypes = new WeakSet();
                                 const debugExt = { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
                                 const deriveWorkerCaps = () => {
                                     const renderer = String(workerWebgl.unmaskedRenderer || workerWebgl.renderer || '').toLowerCase();
@@ -1380,7 +1668,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                                     return value;
                                 };
                                 const hookProto = (proto) => {
-                                    if (!proto || proto[patchKey]) return;
+                                    if (!proto || patchedWebglPrototypes.has(proto)) return;
                                     try {
                                         const origGetParameter = proto.getParameter;
                                         const origGetExtension = proto.getExtension;
@@ -1408,7 +1696,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                                                 return list;
                                             }, 'getSupportedExtensions');
                                         }
-                                        Object.defineProperty(proto, patchKey, { value: true, configurable: true });
+                                        patchedWebglPrototypes.add(proto);
                                     } catch (e) { }
                                 };
 
@@ -1433,28 +1721,58 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                                     try {
                                         const rendererText = String(workerWebgl.unmaskedRenderer || workerWebgl.renderer || '');
                                         const vendorText = String(workerWebgl.unmaskedVendor || workerWebgl.vendor || '');
-                                        const fakeAdapterInfo = Object.freeze({
+                                        const adapterInfoOverrides = Object.freeze({
                                             vendor: vendorText || 'Unknown',
                                             architecture: vendorText || 'Unknown',
                                             device: rendererText || 'Generic GPU',
                                             description: rendererText || 'Generic GPU Adapter'
                                         });
                                         const origRequestAdapter = nav.gpu.requestAdapter.bind(nav.gpu);
-                                        const wrapped = async function requestAdapter(options) {
-                                            const adapter = await origRequestAdapter(options);
-                                            if (!adapter || typeof adapter !== 'object') return adapter;
-                                            return new Proxy(adapter, {
-                                                get(target, prop, receiver) {
-                                                    if (prop === 'requestAdapterInfo') {
-                                                        return makeNative(async function requestAdapterInfo() {
-                                                            return fakeAdapterInfo;
-                                                        }, 'requestAdapterInfo');
+                                        const adapterProxies = new WeakMap();
+                                        const adapterInfoProxies = new WeakMap();
+                                        const wrapAdapterInfo = (info) => {
+                                            if (!info || typeof info !== 'object') return info;
+                                            if (adapterInfoProxies.has(info)) return adapterInfoProxies.get(info);
+                                            const proxy = new Proxy(info, {
+                                                get(target, prop) {
+                                                    if (Object.prototype.hasOwnProperty.call(adapterInfoOverrides, prop)) {
+                                                        return adapterInfoOverrides[prop];
                                                     }
-                                                    if (prop === 'info') return fakeAdapterInfo;
-                                                    const value = Reflect.get(target, prop, receiver);
+                                                    const value = Reflect.get(target, prop, target);
                                                     return typeof value === 'function' ? value.bind(target) : value;
                                                 }
                                             });
+                                            adapterInfoProxies.set(info, proxy);
+                                            return proxy;
+                                        };
+                                        const wrapped = async function requestAdapter(options) {
+                                            const adapter = await origRequestAdapter(options);
+                                            if (!adapter || typeof adapter !== 'object') return adapter;
+                                            if (adapterProxies.has(adapter)) return adapterProxies.get(adapter);
+                                            const boundMethods = new Map();
+                                            let requestAdapterInfoWrapper = null;
+                                            const proxy = new Proxy(adapter, {
+                                                get(target, prop, receiver) {
+                                                    if (prop === 'requestAdapterInfo') {
+                                                        const original = Reflect.get(target, prop, target);
+                                                        if (typeof original !== 'function') return original;
+                                                        if (!requestAdapterInfoWrapper) {
+                                                            requestAdapterInfoWrapper = makeNative(async function requestAdapterInfo() {
+                                                                const info = await original.apply(target, arguments);
+                                                                return wrapAdapterInfo(info);
+                                                            }, 'requestAdapterInfo', original);
+                                                        }
+                                                        return requestAdapterInfoWrapper;
+                                                    }
+                                                    if (prop === 'info') return wrapAdapterInfo(Reflect.get(target, prop, target));
+                                                    const value = Reflect.get(target, prop, target);
+                                                    if (typeof value !== 'function') return value;
+                                                    if (!boundMethods.has(prop)) boundMethods.set(prop, value.bind(target));
+                                                    return boundMethods.get(prop);
+                                                }
+                                            });
+                                            adapterProxies.set(adapter, proxy);
+                                            return proxy;
                                         };
                                         Object.defineProperty(Object.getPrototypeOf(nav.gpu), 'requestAdapter', {
                                             value: makeNative(wrapped, 'requestAdapter'),
@@ -1467,7 +1785,8 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                         } catch (e) { }
                     };
 
-                    const bootstrap = '(' + workerPatch.toString() + ')(' + payload + ');';
+                    const canvasBootstrap = 'const applyCanvasNoise = ' + ${JSON.stringify(stableCanvasNoiseSource)} + ';';
+                    const bootstrap = canvasBootstrap + '\\n(' + workerPatch.toString() + ')(' + payload + ');';
                     if (isModule) {
                         return bootstrap + '\\nimport(' + JSON.stringify(sourceUrl) + ');';
                     }
@@ -1516,7 +1835,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             if (window.RTCPeerConnection) {
                 const OriginalRTCPeerConnection = window.RTCPeerConnection;
                 const HookedRTCPeerConnection = function RTCPeerConnection(config) {
-                    const nextConfig = config || {};
+                    const nextConfig = config ? { ...config } : {};
                     nextConfig.iceTransportPolicy = 'relay';
                     return new OriginalRTCPeerConnection(nextConfig);
                 };
