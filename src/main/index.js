@@ -939,88 +939,194 @@ function buildExtensionInstallShimSource(wrapperRelPath, originalWorkerRelPath, 
         .replace(/\\/g, '/')
         .replace(/'/g, "\\'");
 
-    const shim = `/* __geekez_oninstalled_shim__ */
-/* __geekez_original_worker__:${originalWorkerRelPath} */
-(() => {
+    const shim = `(() => {
   try {
     const runtime = globalThis.chrome?.runtime || globalThis.browser?.runtime;
     const storage = globalThis.chrome?.storage?.local || globalThis.browser?.storage?.local;
     if (!runtime?.onInstalled?.addListener || !storage?.get || !storage?.set) return;
 
-    const KEY = '__geekez_extension_seen_once__';
+    const LEGACY_KEY = '__geekez_extension_seen_once__';
+    const VERSION_KEY = '__geekez_extension_installed_version__';
     const originalAddListener = runtime.onInstalled.addListener.bind(runtime.onInstalled);
+    const originalRemoveListener = typeof runtime.onInstalled.removeListener === 'function'
+      ? runtime.onInstalled.removeListener.bind(runtime.onInstalled)
+      : null;
+    const originalHasListener = typeof runtime.onInstalled.hasListener === 'function'
+      ? runtime.onInstalled.hasListener.bind(runtime.onInstalled)
+      : null;
+    const wrappedListeners = new WeakMap();
+    const eventDecisions = new WeakMap();
 
-    const readSeen = (callback) => {
-      try {
-        if (storage.get.length >= 2) {
-          storage.get([KEY], (result) => callback(!!(result && result[KEY])));
-          return;
-        }
-        Promise.resolve(storage.get(KEY))
-          .then((result) => callback(!!(result && result[KEY])))
-          .catch(() => callback(false));
-      } catch (e) {
-        callback(false);
-      }
+    const finishOnce = (resolve) => {
+      let finished = false;
+      return (value) => {
+        if (finished) return;
+        finished = true;
+        resolve(value);
+      };
     };
 
-    const markSeen = () => {
+    const readInstallState = () => new Promise((resolve) => {
+      const finish = finishOnce(resolve);
       try {
-        if (storage.set.length >= 2) {
-          storage.set({ [KEY]: Date.now() }, () => {});
-          return;
+        const pending = storage.get(null, (result) => finish(result || {}));
+        if (pending && typeof pending.then === 'function') {
+          pending.then((result) => finish(result || {})).catch(() => finish({}));
         }
-        storage.set({ [KEY]: Date.now() });
-      } catch (e) {}
+      } catch (e) {
+        try {
+          Promise.resolve(storage.get(null))
+            .then((result) => finish(result || {}))
+            .catch(() => finish({}));
+        } catch (inner) {
+          finish({});
+        }
+      }
+    });
+
+    const writeInstallState = (version) => new Promise((resolve) => {
+      const finish = finishOnce(resolve);
+      const values = {
+        [LEGACY_KEY]: true,
+        [VERSION_KEY]: String(version || '')
+      };
+      try {
+        const pending = storage.set(values, () => finish());
+        if (pending && typeof pending.then === 'function') {
+          pending.then(() => finish()).catch(() => finish());
+        }
+      } catch (e) {
+        try {
+          Promise.resolve(storage.set(values)).then(() => finish()).catch(() => finish());
+        } catch (inner) {
+          finish();
+        }
+      }
+    });
+
+    const installStateAtStartup = (async () => {
+      const state = await readInstallState();
+      const currentVersion = String(runtime.getManifest?.().version || '');
+      const storedVersion = String(state && state[VERSION_KEY] || '');
+      const legacySeen = !!(state && state[LEGACY_KEY]);
+      const hasExistingState = Object.keys(state || {}).some((key) => {
+        return key !== LEGACY_KEY && key !== VERSION_KEY;
+      });
+
+      if (storedVersion !== currentVersion || !legacySeen) {
+        await writeInstallState(currentVersion);
+      }
+
+      return { currentVersion, storedVersion, legacySeen, hasExistingState };
+    })().catch(() => null);
+
+    const decideInstallEvent = (details) => {
+      if (!details || typeof details !== 'object') {
+        return Promise.resolve({ emit: true, details });
+      }
+      if (eventDecisions.has(details)) return eventDecisions.get(details);
+
+      const decision = (async () => {
+        const repeatedLifecycleEvent = details.reason === 'install' || details.reason === 'update';
+
+        if (!repeatedLifecycleEvent) {
+          return { emit: true, details };
+        }
+
+        const startupState = await installStateAtStartup;
+        if (!startupState) {
+          return { emit: true, details };
+        }
+
+        const { currentVersion, storedVersion, legacySeen, hasExistingState } = startupState;
+
+        if (storedVersion) {
+          if (storedVersion === currentVersion) {
+            return { emit: false, details };
+          }
+          if (storedVersion !== currentVersion) {
+            return {
+              emit: true,
+              details: Object.assign({}, details, {
+                reason: 'update',
+                previousVersion: storedVersion
+              })
+            };
+          }
+          return { emit: true, details };
+        }
+
+        if (legacySeen || hasExistingState) {
+          return { emit: false, details };
+        }
+        return { emit: true, details };
+      })().catch(() => ({ emit: true, details }));
+
+      eventDecisions.set(details, decision);
+      return decision;
     };
 
     runtime.onInstalled.addListener = (listener) => {
       if (typeof listener !== 'function') {
         return originalAddListener(listener);
       }
+      if (wrappedListeners.has(listener)) {
+        return originalAddListener(wrappedListeners.get(listener));
+      }
 
       const wrapped = (details) => {
-        const originalDetails = details;
-        const emit = (payload) => {
-          try {
-            listener(payload);
-          } catch (e) {
-            try { listener(originalDetails); } catch (inner) {}
-          }
-        };
-
-        readSeen((seen) => {
-          if (!seen) {
-            markSeen();
-            emit(originalDetails);
-            return;
-          }
-
-          if (originalDetails && originalDetails.reason === 'install') {
-            const mapped = Object.assign({}, originalDetails, { reason: 'update' });
-            if (!mapped.previousVersion) {
-              try {
-                mapped.previousVersion = runtime.getManifest?.().version || '';
-              } catch (e) {}
-            }
-            emit(mapped);
-            return;
-          }
-
-          emit(originalDetails);
+        decideInstallEvent(details).then((decision) => {
+          if (!decision || !decision.emit) return;
+          try { listener(decision.details); } catch (e) {}
         });
       };
 
+      wrappedListeners.set(listener, wrapped);
       return originalAddListener(wrapped);
     };
+
+    if (originalRemoveListener) {
+      runtime.onInstalled.removeListener = (listener) => {
+        const wrapped = wrappedListeners.get(listener) || listener;
+        wrappedListeners.delete(listener);
+        return originalRemoveListener(wrapped);
+      };
+    }
+
+    if (originalHasListener) {
+      runtime.onInstalled.hasListener = (listener) => {
+        return originalHasListener(wrappedListeners.get(listener) || listener);
+      };
+    }
   } catch (e) {}
 })();
 `;
 
     if (isModuleType) {
-        return `${shim}\nimport '${importTarget}';\n`;
+        const moduleShimSource = `/* __geekez_oninstalled_shim_runtime__ */\n${shim}`;
+        const moduleShimDigest = crypto.createHash('sha256')
+            .update(moduleShimSource)
+            .digest('hex')
+            .slice(0, 12);
+        const shimRelPath = path.posix.join(
+            path.posix.dirname(toManifestPath(wrapperRelPath)),
+            `__geekez_sw_install_shim_${moduleShimDigest}.js`
+        );
+        const shimImportTarget = toRelativeWorkerPath(wrapperRelPath, shimRelPath)
+            .replace(/\\/g, '/')
+            .replace(/'/g, "\\'");
+        return {
+            wrapperSource: `/* __geekez_oninstalled_shim__ */\n/* __geekez_original_worker__:${originalWorkerRelPath} */\nimport '${shimImportTarget}';\nimport '${importTarget}';\n`,
+            moduleShim: {
+                relPath: shimRelPath,
+                source: moduleShimSource
+            }
+        };
     }
-    return `${shim}\ntry { importScripts('${importTarget}'); } catch (e) {}\n`;
+    return {
+        wrapperSource: `/* __geekez_oninstalled_shim__ */\n/* __geekez_original_worker__:${originalWorkerRelPath} */\n${shim}\ntry { importScripts('${importTarget}'); } catch (e) {}\n`,
+        moduleShim: null
+    };
 }
 
 async function patchExtensionInstallBehavior(extensionDir) {
@@ -1034,14 +1140,14 @@ async function patchExtensionInstallBehavior(extensionDir) {
     const currentServiceWorker = toManifestPath(bg.service_worker || '');
     if (!currentServiceWorker) return false;
 
-    const bootstrapPattern = /(^|\/)__geekez_sw_bootstrap__\.js$/;
+    const bootstrapPattern = /(^|\/)__geekez_sw_bootstrap(?:__|_[a-f0-9]{12})\.js$/;
     const isBootstrapWorker = bootstrapPattern.test(currentServiceWorker);
-    const wrapperRelPath = isBootstrapWorker
+    let wrapperRelPath = isBootstrapWorker
         ? currentServiceWorker
         : (path.posix.dirname(currentServiceWorker) === '.'
             ? '__geekez_sw_bootstrap__.js'
             : `${path.posix.dirname(currentServiceWorker)}/__geekez_sw_bootstrap__.js`);
-    const wrapperAbsPath = path.join(extensionDir, ...wrapperRelPath.split('/'));
+    let wrapperAbsPath = path.join(extensionDir, ...wrapperRelPath.split('/'));
 
     let workerRelPath = currentServiceWorker;
     if (isBootstrapWorker && fs.existsSync(wrapperAbsPath)) {
@@ -1069,9 +1175,41 @@ async function patchExtensionInstallBehavior(extensionDir) {
     if (!fs.existsSync(workerAbsPath)) return false;
 
     const isModuleType = String(bg.type || '').toLowerCase() === 'module';
-    const wrapperSource = buildExtensionInstallShimSource(wrapperRelPath, workerRelPath, isModuleType);
+    let { wrapperSource, moduleShim } = buildExtensionInstallShimSource(
+        wrapperRelPath,
+        workerRelPath,
+        isModuleType
+    );
+    const wrapperDigest = crypto.createHash('sha256')
+        .update(wrapperSource)
+        .digest('hex')
+        .slice(0, 12);
+    const hashedWrapperRelPath = path.posix.join(
+        path.posix.dirname(wrapperRelPath),
+        `__geekez_sw_bootstrap_${wrapperDigest}.js`
+    );
+    if (hashedWrapperRelPath !== wrapperRelPath) {
+        wrapperRelPath = hashedWrapperRelPath;
+        wrapperAbsPath = path.join(extensionDir, ...wrapperRelPath.split('/'));
+        ({ wrapperSource, moduleShim } = buildExtensionInstallShimSource(
+            wrapperRelPath,
+            workerRelPath,
+            isModuleType
+        ));
+    }
 
     let changed = false;
+    if (moduleShim) {
+        const moduleShimAbsPath = path.join(extensionDir, ...moduleShim.relPath.split('/'));
+        const currentModuleShimSource = fs.existsSync(moduleShimAbsPath)
+            ? await fs.readFile(moduleShimAbsPath, 'utf8').catch(() => '')
+            : '';
+        if (currentModuleShimSource !== moduleShim.source) {
+            await fs.outputFile(moduleShimAbsPath, moduleShim.source, 'utf8');
+            changed = true;
+        }
+    }
+
     let currentWrapperSource = '';
     if (fs.existsSync(wrapperAbsPath)) {
         currentWrapperSource = await fs.readFile(wrapperAbsPath, 'utf8').catch(() => '');
@@ -1088,67 +1226,6 @@ async function patchExtensionInstallBehavior(extensionDir) {
         };
         await fs.writeJson(manifestPath, manifest);
         changed = true;
-    }
-
-    return changed;
-}
-
-async function patchKnownExtensionOnboarding(extensionDir, storeId = '') {
-    const id = String(storeId || '').toLowerCase();
-    if (!['bpoadfkcbjbfhfodiogcnhhhpibjhbnh', 'amkbmndfnliijdhojkpoglbnaaahippg'].includes(id)) {
-        return false;
-    }
-
-    const jsFiles = [];
-    const walk = async (dir) => {
-        const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
-        for (const entry of entries) {
-            const full = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-                await walk(full);
-                continue;
-            }
-            if (entry.isFile() && /\.(js|mjs|cjs)$/i.test(entry.name)) {
-                jsFiles.push(full);
-            }
-        }
-    };
-    await walk(extensionDir);
-
-    let changed = false;
-    for (const filePath of jsFiles) {
-        let content;
-        try {
-            content = await fs.readFile(filePath, 'utf8');
-        } catch (e) {
-            continue;
-        }
-        if (!/onboarding|GUIDE_BASE|onboardingDisplayTime/i.test(content)) continue;
-
-        let next = content;
-        // Immersive Translate unpacked extension may fire onInstalled on every launch.
-        // Force onboarding link creation to run only once when onboardingDisplayTime is empty.
-        next = next.replace(
-            /([a-zA-Z_$][\w$]*)\?([a-zA-Z_$][\w$]*)\|\|\(await _e\("onboardingDisplayTime",new Date\(\)\.toISOString\(\)\),([a-zA-Z_$][\w$]*\.tabs\.create\(\{url:[a-zA-Z_$][\w$]*\.toString\(\)\}\))\):([a-zA-Z_$][\w$]*\.tabs\.create\(\{url:[a-zA-Z_$][\w$]*\.toString\(\)\}\))/g,
-            (_m, _platformFlag, onboardingFlag, createOnceExpr) => `${onboardingFlag}||(await _e("onboardingDisplayTime",new Date().toISOString()),${createOnceExpr})`
-        );
-        next = next.replace(
-            'a?o||(await _e("onboardingDisplayTime",new Date().toISOString()),w.tabs.create({url:s.toString()})):w.tabs.create({url:s.toString()})',
-            'o||(await _e("onboardingDisplayTime",new Date().toISOString()),w.tabs.create({url:s.toString()}))'
-        );
-        next = next.replace(
-            /(?:chrome|browser)\.tabs\.create\(\s*\{[\s\S]{0,260}?onboarding\.immersivetranslate\.com[\s\S]{0,260}?\}\s*\)\s*;?/g,
-            'Promise.resolve()'
-        );
-        next = next.replace(
-            /(?:chrome|browser)\.tabs\.create\(\s*\{[\s\S]{0,260}?(?:\?t=i&v=|onboarding\\?\.immersivetranslate\\?\.com)[\s\S]{0,260}?\}\s*\)\s*;?/g,
-            'Promise.resolve()'
-        );
-
-        if (next !== content) {
-            await fs.writeFile(filePath, next);
-            changed = true;
-        }
     }
 
     return changed;
@@ -4275,8 +4352,6 @@ ipcMain.handle('add-user-extension', async (e, payload) => {
                 const extracted = await extractCrxToDirectory(crxPath, outputDir);
                 sendProgress(80, '正在优化扩展安装行为...');
                 await patchExtensionInstallBehavior(outputDir).catch(() => { });
-                sendProgress(82, '正在优化扩展首次启动体验...');
-                await patchKnownExtensionOnboarding(outputDir, storeId).catch(() => { });
                 sendProgress(90, '扩展解析完成');
                 installed = {
                     id: `store_${storeId}`,
@@ -5397,8 +5472,6 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         const userExtensions = getProfileUserExtensions(settings, profileId);
         for (const ext of userExtensions) {
             await patchExtensionInstallBehavior(ext.path).catch(() => { });
-            const extStoreId = sanitizeExtensionStoreId(ext.storeId) || sanitizeExtensionStoreId(String(ext.id || '').replace(/^store_/, ''));
-            await patchKnownExtensionOnboarding(ext.path, extStoreId).catch(() => { });
         }
         const userExtPaths = userExtensions.map(ext => ext.path);
 
