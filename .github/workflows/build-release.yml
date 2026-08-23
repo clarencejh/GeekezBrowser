@@ -90,7 +90,22 @@ jobs:
           [ "${{ matrix.os }}" != "win32" ] && chmod +x "$BIN_DIR/xray" || true
 
       - name: Download Chrome
+        if: matrix.os != 'linux' || matrix.arch != 'arm64'
         run: npx @puppeteer/browsers install chrome@150.0.7871.115 --path resources/puppeteer
+
+      - name: Download Chrome Beta ARM64
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_ID='153.0.8010.5'
+          ROOT="resources/puppeteer/chrome/linux_arm64-$BUILD_ID"
+          mkdir -p "$ROOT"
+          curl -fL --retry 3 -o /tmp/chrome-linux-arm64.zip \
+            "https://storage.googleapis.com/chrome-for-testing-public/$BUILD_ID/linux-arm64/chrome-linux-arm64.zip"
+          unzip -q /tmp/chrome-linux-arm64.zip -d "$ROOT"
+          rm -f /tmp/chrome-linux-arm64.zip
+          chmod +x "$ROOT/chrome-linux-arm64/chrome"
 
       - name: Build macOS
         if: matrix.os == 'darwin'
