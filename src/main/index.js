@@ -2424,6 +2424,35 @@ function getChromiumPath() {
     return chromiumLocator.getChromiumPath(lookupContext);
 }
 
+function disableNativePasswordManager(userDataDir) {
+    if (!userDataDir) return;
+    const preferencesPath = path.join(userDataDir, 'Default', 'Preferences');
+    const temporaryPath = `${preferencesPath}.geekez-tmp`;
+    try {
+        fs.ensureDirSync(path.dirname(preferencesPath));
+        let preferences = {};
+        if (fs.existsSync(preferencesPath)) {
+            preferences = fs.readJsonSync(preferencesPath);
+        }
+        preferences.credentials_enable_service = false;
+        preferences.profile = {
+            ...(preferences.profile && typeof preferences.profile === 'object' ? preferences.profile : {}),
+            password_manager_enabled: false
+        };
+        fs.writeJsonSync(temporaryPath, preferences);
+        try {
+            fs.renameSync(temporaryPath, preferencesPath);
+        } catch (renameError) {
+            // Windows does not replace an existing file with renameSync.
+            fs.copyFileSync(temporaryPath, preferencesPath);
+            fs.removeSync(temporaryPath);
+        }
+    } catch (error) {
+        try { fs.removeSync(temporaryPath); } catch (cleanupError) { }
+        console.warn('[Password Manager] Failed to disable native password prompts:', error.message);
+    }
+}
+
 // Settings management
 function loadSettings() {
     try {
@@ -5496,6 +5525,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         const launchArgs = [
             `--user-data-dir=${userDataDir}`,
+            '--disable-save-password-bubble',
             `--window-size=${launchWindow.width || 1280},${launchWindow.height || 800}`,
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -5586,6 +5616,10 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             }
             throw new Error("Chrome binary not found.");
         }
+
+        // GeekEZ Guard owns credential capture and autofill. Disable only the
+        // Chromium UI prompt so it cannot cover pages during automation.
+        disableNativePasswordManager(userDataDir);
 
         // 时区设置
         const env = { ...process.env };
