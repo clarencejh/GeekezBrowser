@@ -2,7 +2,7 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { applyStableAudioNoise } = require('./audio-noise');
-const { applyStableCanvasNoise } = require('./canvas-noise');
+const { applyStableCanvasNoise, isStableCanvasNoiseSeed } = require('./canvas-noise');
 const { selectStableMediaDevices } = require('./media-device-profile');
 const { selectStableVoices } = require('./voice-profile');
 
@@ -487,6 +487,16 @@ function randInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+function generateCanvasSafeNoiseSeed() {
+    // A sparse probe canvas is used by font detectors. Select a random seed
+    // whose hit count stays low enough not to split fallback font groups.
+    for (let attempt = 0; attempt < 32; attempt += 1) {
+        const candidate = randInt(1000, 9999999);
+        if (isStableCanvasNoiseSeed(candidate)) return candidate;
+    }
+    return 9535147;
+}
+
 function getRandom(arr) {
     return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -766,7 +776,7 @@ function generateFingerprint(options = {}) {
             a: randInt(-5, 5)
         },
         audioNoise: typeof options.audioNoise === 'number' ? options.audioNoise : (Math.random() * 0.000001),
-        noiseSeed: asNumber(options.noiseSeed) || randInt(1000, 9999999),
+        noiseSeed: asNumber(options.noiseSeed) || generateCanvasSafeNoiseSeed(),
         timezone: options.timezone || 'America/Los_Angeles',
         city: options.city || null,
         geolocation: options.geolocation || null,
